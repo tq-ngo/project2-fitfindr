@@ -41,7 +41,13 @@
 
 <!-- Three or four sentences: what a user asks for, and what they get back. -->
 
-
+You type what you're thrifting for in plain language, like `vintage graphic tee
+under $30` or `denim jacket in a medium, below 50`. FitFindr searches 40
+secondhand listings (depop, thredUp, poshmark) for the best match within your
+size and budget, suggests two outfits that pair it with pieces already in your
+wardrobe, and writes a short caption you could post with the fit. If nothing
+matches, it stops and tells you which filter to loosen. It won't make up an
+outfit for an item that doesn't exist.
 
 ---
 
@@ -59,24 +65,54 @@
 
 ### `search_listings`
 
-- **What it does:**
-- **Inputs:** <!-- name and type each: `max_price` (float), not "a price" -->
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Filters `data/listings.json` by price ceiling and size,
+  scores what's left by keyword overlap with the description (title word = 3,
+  tag/color/category/brand word = 2, seller-description word = 1), and returns
+  the best matches first.
+- **Inputs:** <!-- name and type each: `max_price` (float), not "a price" --> `description` (str): keywords, e.g. `"vintage graphic tee"`.
+  `size` (str | None): e.g. `"M"`, `"US 8"`, `"W30"`; `None` skips the size
+  filter. `max_price` (float | None): inclusive ceiling; `None` skips it.
+- **Returns:** `list[dict]`, at most `config.SEARCH_RESULT_LIMIT` (10) listing
+  dicts sorted by score, highest first (ties go to the cheaper one). Each has
+  `id`, `title`, `description`, `category`, `style_tags` (list), `size`,
+  `condition`, `price` (float), `colors` (list), `brand` (str or None),
+  `platform`. **Size rule:** every token of the requested size must appear as
+  a whole token in the listing's size, so `M` matches `M`, `S/M`, `M/L` but
+  never `US 9`. `L` never matches `XL`, and `US 8` never matches `US 8.5`.
+  Listings sized "One Size" match any size.
+- **When it has nothing:** an empty list `[]`. Never `None`, never an
+  exception. That covers no keyword hits, everything filtered out, or a
+  description with only stopwords (e.g. `""`).
 
 ### `suggest_outfit`
 
-- **What it does:**
-- **Inputs:**
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Asks the model (via `generate()`) for two outfits built
+  around the new item, naming pieces the user already owns.
+- **Inputs:** `new_item` (dict): one listing dict from `search_listings`.
+  `wardrobe` (dict): `{"items": [ {id, name, category, colors, style_tags,
+notes}, ... ]}`, and `items` may be empty.
+- **Returns:** `str`, non-empty plain text: `"Outfit 1: …"` and `"Outfit 2: …"`,
+  each naming wardrobe pieces by their exact `name`.
+- **When it has nothing:** an empty wardrobe (`items == []`) still returns a
+  non-empty string. It gives two outfits built from common staples (white tee,
+  straight-leg jeans, etc.) plus one thrifting tip. If the model returns an
+  empty reply, it returns a hard-coded fallback outfit string. It never
+  returns `""`.
 
 ### `create_fit_card`
 
-- **What it does:**
-- **Inputs:**
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Asks the model for a short social-media caption about the
+  find and how it's styled.
+- **Inputs:** `outfit` (str): the text from `suggest_outfit`. `new_item`
+  (dict): the same listing dict.
+- **Returns:** `str`, one caption of 2–4 sentences (prompted for under 60
+  words) that mentions the item, its price (e.g. `$24`) and its platform once
+  each, with at most 2 emoji and 3 hashtags. It doesn't name a brand unless the
+  listing has one.
+- **When it has nothing:** if `outfit` is empty or whitespace, it makes no
+  model call and returns `"Couldn't write a fit card: no outfit suggestion was
+provided for <title>."`. If the model returns an empty reply, it returns a
+  template caption with the title, price and platform.
 
 ---
 
@@ -93,13 +129,34 @@
      The grader checks your code against what you claim here, so the file and
      function have to be real. -->
 
-**Branch rule:**
+**Branch rule:** If `search_listings` returns an empty list, put a message in
+`session["error"]` that names the filter to change, and stop. `suggest_outfit`
+and `create_fit_card` are never called, so `outfit_suggestion` and `fit_card`
+stay `None`. Otherwise, take the first result into `session["selected_item"]`
+and go to `suggest_outfit`, then `create_fit_card`.
 
-**Where it lives:** `agent.py::run_agent`
+To find which filter to name, the message re-runs the local search with one
+filter relaxed at a time (no model calls). If dropping the price finds
+something, it says "raise your budget, the cheapest match is $X". If dropping
+the size finds something, it lists the sizes that exist. Otherwise it suggests
+different keywords or categories.
 
-**How the query is parsed:** <!-- regex, string splitting, or asking the model — say which -->
+**Where it lives:** `agent.py::run_agent` (message built by
+`agent.py::_no_results_message`)
 
-**What moves through the session:** <!-- which fields, in what order -->
+**How the query is parsed:** <!-- regex, string splitting, or asking the model — say which --> Regex, in `agent.py::parse_query`. Price phrases
+(`under/below/less than/max/up to $N`, `<= N`, or a bare `$N`) become
+`max_price`. Size phrases (`size M`, `size: US 8.5`, `size W30`, `in a medium`)
+become `size`, with small/medium/large mapped to S/M/L. Both are cut out of the
+text, and what's left is the `description`.
+
+**What moves through the session:** <!-- which fields, in what order --> `query` → `parsed` {description, size,
+max_price} → `search_results` → `selected_item` (= `search_results[0]`) →
+`outfit_suggestion` → `fit_card`. `error` is set only on the early stop. The
+loop is a `while next_step != "done"` state machine that calls
+`trace.check_iterations()` on every pass. Each step reads its inputs from the
+session and writes its result back. No value is passed directly from one tool
+call to the next.
 
 ---
 
@@ -113,26 +170,52 @@
 **One full query**
 
 ```
-$ python app.py ask '...'
+$ python app.py ask 'vintage graphic tee under $30'
 
+  Found:    Graphic Tee — 2003 Tour Bootleg Style — $24.0 on depop
+
+  Outfit:   Outfit 1: Pair the Graphic Tee — 2003 Tour Bootleg Style with your baggy straight-leg jeans, black combat boots, and black crossbody bag for an effortless grunge streetwear look.
+
+Outfit 2: Layer the Vintage black denim jacket over the Graphic Tee — 2003 Tour Bootleg Style, paired with your wide-leg khaki trousers and chunky white sneakers for a cool contrast of earth tones and edgy graphics.
+
+  Fit card: Nothing beats a perfectly worn-in tee. Throwing this graphic tee on with baggy jeans and chunky boots gives major effortless grunge vibes. Grab it on depop for just $24 before I change my mind. 🖤⛓️
+
+#depop #grungetyle #y2k
+```
+
+**And the branch: a query that matches nothing**
+
+```
+$ python agent.py
+...
+=== A query it can't ===
+  stopped: No listings matched 'designer ballgown' (size XXS, under $5). Try different keywords — a category (tops, bottoms, outerwear, shoes, accessories) or a style like 'vintage', 'y2k', 'grunge'.
+  fit_card is None — it should still be None here
 ```
 
 **The three tools, tested one at a time**
 
 ```
 $ python -c "from tools import search_listings; print(search_listings('graphic tee', max_price=30))"
-
+[{'id': 'lst_006', 'title': 'Graphic Tee — 2003 Tour Bootleg Style', 'description': 'Vintage-style bootleg tee with faded graphic. Slightly boxy fit. 100% cotton, soft and worn-in.', 'category': 'tops', 'style_tags': ['graphic tee', 'vintage', 'grunge', 'streetwear', 'band tee'], 'size': 'L', 'condition': 'good', 'price': 24.0, 'colors': ['black'], 'brand': None, 'platform': 'depop'}, {'id': 'lst_002', ... (7 listings total, all <= $30)
 ```
 
 ```
-$ python -c "from tools import suggest_outfit; ..."
+$ python -c "from tools import suggest_outfit; from utils.data_loader import get_example_wardrobe, load_listings; print(suggest_outfit(load_listings()[0], get_example_wardrobe()))"
+Outfit 1: Pair the Vintage Levi's 501 Jeans — Medium Wash with the White ribbed tank top, Black cropped zip hoodie, and Chunky white sneakers for an easy, casual streetwear look.
 
+Outfit 2: Style the Vintage Levi's 501 Jeans — Medium Wash with the Oversized grey crewneck sweatshirt, Brown leather belt, and Black combat boots for a cozy, vintage-inspired outfit.
 ```
 
 ```
-$ python -c "from tools import create_fit_card; ..."
+$ python -c "from tools import create_fit_card; from utils.data_loader import load_listings; print(create_fit_card('jeans and white sneakers', load_listings()[0]))"
+Nothing beats the knee-fading on these vintage Levi's. Paired with crisp white sneakers, it's the ultimate casual weekend fit. Grab them on depop for $38 before I change my mind. 👖✨
 
+#vintagelevis #denim #streetwear
 ```
+
+Run three times with `AI201_CACHE=0`: three different captions, same facts
+($38, depop, Levi's). The temperature (0.9) is doing its job.
 
 ---
 
@@ -147,15 +230,62 @@ $ python -c "from tools import create_fit_card; ..."
 
 **Moment 1**
 
-- *What I asked for:*
-- *What came back:*
-- *What I changed:*
+- _What I asked for:_ I gave Claude my `search_listings` spec (description, size, max_price; empty list on no match) and the starter's warning that `"s" in "us 9"` is True, and asked for the tool built on `load_listings()`.
+- _What came back:_ A filter that matches sizes as whole tokens (so `M` matches `S/M` but not `US 9`, and `L` doesn't match `XL`) and ranks by weighted keyword overlap, returning `[]` when nothing matches. Its first tokenizer used `[a-z0-9.]+`, which would have glued a sentence-ending period onto a word ("tee." would not match "tee"). Running it also showed a limit: `leather bomber under $20` returns a $12 leather belt, because "leather" matches and the $75 bomber is over budget.
+- _What I changed:_ I changed the tokenizer to `[a-z0-9]+(?:\.[0-9]+)?` so "8.5" stays one token but trailing periods don't stick. I tested `search_listings` on its own with a size/price query, an impossible query and an empty string before wiring it in. I left the belt result alone because it's a keyword-match limit, not a bug, and it is the kind of miss criterion 1's "4 of 5" allows for. I also simplified the stopword comment in `tools.py` to my own wording.
 
 **Moment 2**
 
-- *What I asked for:*
-- *What came back:*
-- *What I changed:*
+- _What I asked for:_ Help drafting the state criterion (criterion 3) and the "why this target" lines for all five criteria.
+- _What came back:_ A state criterion that said the selected item's title "appears in the fit card's prompt input". Nothing in the session records that, so nobody could check it without reading my code.
+- _What I changed:_ I cut that clause so criterion 3 only checks things you can print from the session: `selected_item["id"]` equals `search_results[0]["id"]`, and `fit_card` mentions that item's price and platform. When Claude first filled in the README and `criteria.md`, it also deleted the template's instruction comments. I caught that and had them restored, so the grader's instructions are still in the file and my answers sit under them.
+
+---
+
+## Stretch Features
+
+**A second branch: the wardrobe check.** This lives in `agent.py::run_agent`, in
+the `check_wardrobe` step that runs after an item is selected and before
+`suggest_outfit`.
+
+The loop now looks at the selected item against the wardrobe and takes one of
+three paths:
+
+| Condition                                                                       | `session["styling_mode"]` | What `suggest_outfit` receives                                                                            |
+| ------------------------------------------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Wardrobe has no items                                                           | `"empty_wardrobe"`        | an empty wardrobe, so it returns staple-based general advice                                              |
+| Wardrobe has items, but none shares a single `style_tag` with the selected item | `"no_style_match"`        | an empty wardrobe, so it returns staple-based advice instead of forcing a y2k piece into a minimal closet |
+| At least one wardrobe item shares a style tag                                   | `"closet"`                | the full wardrobe                                                                                         |
+
+The wardrobe that actually went into the tool is stored in
+`session["wardrobe_used"]`, and the reason is in `session["styling_note"]`, so
+the path taken can be read straight from the session. The selected item never
+changes. This branch only decides what the second tool is given, so criterion
+3 still holds.
+
+Why this condition: with the example wardrobe, 2 of the 40 listings share no
+style tag with anything the user owns (`lst_009` Platform Mary Janes, with
+y2k/goth/platform/90s, and `lst_023` Crochet Halter Top, with
+cottagecore/boho/crochet/summer). Before this branch, the model was asked to
+build outfits from a closet that didn't fit the piece.
+
+**All three paths, from the CLI:**
+
+```
+$ python app.py ask 'vintage graphic tee under $30'
+  Found:    Graphic Tee — 2003 Tour Bootleg Style — $24.0 on depop
+  Styling:  [closet] Matched your wardrobe on: grunge, streetwear, vintage.
+
+$ python app.py ask 'mary janes'
+  Found:    Platform Mary Janes — Black Patent — $55.0 on depop
+  Styling:  [no_style_match] Nothing in your wardrobe shares a style with this piece (y2k, goth, platform, 90s) — styling it with staples instead.
+  Outfit:   Outfit 1: Pair them with a black pleated mini skirt, a snug white baby tee, and sheer black tights.
+  ...
+
+$ python app.py ask 'denim jacket under $50' --empty-wardrobe
+  Found:    Denim Jacket — Light Wash, Cropped — $42.0 on poshmark
+  Styling:  [empty_wardrobe] No saved wardrobe — styling with common staples.
+```
 
 <!-- ═══════════════════════ UNIT 4 — THE TEST ═══════════════════════
 
@@ -176,12 +306,12 @@ $ python -c "from tools import create_fit_card; ..."
      into results/. Paste it here and fill in the verdicts. -->
 
 | Criterion | Target | Try 1 | Try 2 | Try 3 | Try 4 | Try 5 | Verdict |
-|---|---|---|---|---|---|---|---|
-| 1.  |  |  |  |  |  |  |  |
-| 2.  |  |  |  |  |  |  |  |
-| 3.  |  |  |  |  |  |  |  |
-| 4.  |  |  |  |  |  |  |  |
-| 5.  |  |  |  |  |  |  |  |
+| --------- | ------ | ----- | ----- | ----- | ----- | ----- | ------- |
+| 1.        |        |       |       |       |       |       |         |
+| 2.        |        |       |       |       |       |       |         |
+| 3.        |        |       |       |       |       |       |         |
+| 4.        |        |       |       |       |       |       |         |
+| 5.        |        |       |       |       |       |       |         |
 
 **Real output from one try**, pasted as text, naming the file and function
 that produced it:
@@ -210,17 +340,15 @@ that produced it:
      Look for a pattern. Three misses on the same tool is one problem, not
      three. -->
 
-| # | Criterion | Target | Verdict | How I decided |
-|---|---|---|---|---|
-| 1 |  |  |  |  |
-| 2 |  |  |  |  |
-| 3 |  |  |  |  |
-| 4 |  |  |  |  |
-| 5 |  |  |  |  |
+| #   | Criterion | Target | Verdict | How I decided |
+| --- | --------- | ------ | ------- | ------------- |
+| 1   |           |        |         |               |
+| 2   |           |        |         |               |
+| 3   |           |        |         |               |
+| 4   |           |        |         |               |
+| 5   |           |        |         |               |
 
 **Diagnoses**
-
-
 
 ---
 
@@ -253,8 +381,6 @@ behaved differently afterwards. If the rewire didn't work, say exactly where it
 broke — the error text and the last thing that worked. That earns the point in
 full. -->
 
-
-
 ---
 
 ## The Improvement
@@ -271,19 +397,17 @@ full. -->
 ### Run Log — After
 
 | Criterion | Target | Try 1 | Try 2 | Try 3 | Try 4 | Try 5 | Verdict |
-|---|---|---|---|---|---|---|---|
-| 1.  |  |  |  |  |  |  |  |
-| 2.  |  |  |  |  |  |  |  |
-| 3.  |  |  |  |  |  |  |  |
-| 4.  |  |  |  |  |  |  |  |
-| 5.  |  |  |  |  |  |  |  |
+| --------- | ------ | ----- | ----- | ----- | ----- | ----- | ------- |
+| 1.        |        |       |       |       |       |       |         |
+| 2.        |        |       |       |       |       |       |         |
+| 3.        |        |       |       |       |       |       |         |
+| 4.        |        |       |       |       |       |       |         |
+| 5.        |        |       |       |       |       |       |         |
 
 **Did it help, and how do I know:**
 
 <!-- If it made things worse, say that. Honestly reported, that earns full
      credit and is more interesting than one that worked. -->
-
-
 
 ---
 
@@ -292,8 +416,6 @@ full. -->
 <!-- For each criterion still missed: what you'd do, and why you stopped where
      you did. "I ran out of time" is fine if it's true. Pretending nothing is
      left is not. -->
-
-
 
 <!-- ═════════════════════════════════════════════════════════════════════
 

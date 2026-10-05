@@ -13,10 +13,104 @@ Build and test your three tools in `tools.py` first. Then come here.
     python agent.py          runs both example paths below
 """
 
-import config
+import re
+
 import trace
 from tools import search_listings, suggest_outfit, create_fit_card
-from generate import ModelUnavailable
+from generate import ModelUnavailable  # noqa: F401 — handler comes in unit 4
+
+
+# ── query parsing (regex) ─────────────────────────────────────────────────────
+
+# "under $30", "below 30", "less than $30", "max $30", "up to 30", "<= $30",
+# or a bare "$30".
+_PRICE_PATTERNS = [
+    re.compile(
+        r"\b(?:under|below|less\s+than|max(?:imum)?|up\s+to|no\s+more\s+than|at\s+most)"
+        r"\s*\$?\s*(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"<=?\s*\$?\s*(\d+(?:\.\d+)?)"),
+    re.compile(r"\$\s*(\d+(?:\.\d+)?)(?:\s*(?:or\s+less|max|and\s+under))?", re.IGNORECASE),
+]
+
+_SIZE_VALUE = (
+    r"us\s*\d+(?:\.\d+)?|w\d+(?:\s*l\d+)?|xxs|xs|xxl|xl|s|m|l|"
+    r"small|medium|large|one\s+size"
+)
+# "size M", "size: US 8", "in a medium", "in size small"
+_SIZE_PATTERNS = [
+    re.compile(rf"\bsize\s*:?\s*({_SIZE_VALUE})\b", re.IGNORECASE),
+    re.compile(rf"\bin\s+(?:a\s+)?({_SIZE_VALUE})\b(?!\s*(?:wash|color|colour))", re.IGNORECASE),
+]
+_SIZE_WORDS = {"small": "S", "medium": "M", "large": "L"}
+
+
+def parse_query(query: str) -> dict:
+    """
+    Split a plain-language query into description / size / max_price, by regex.
+
+    The price and size phrases are cut out of the text; whatever is left is the
+    description. Nothing found means None for that field (no filter).
+    """
+    text = query or ""
+    max_price = None
+    for pattern in _PRICE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            max_price = float(match.group(1))
+            text = text[: match.start()] + " " + text[match.end():]
+            break
+
+    size = None
+    for pattern in _SIZE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raw = re.sub(r"\s+", " ", match.group(1).strip())
+            size = _SIZE_WORDS.get(raw.lower(), raw.upper())
+            text = text[: match.start()] + " " + text[match.end():]
+            break
+
+    description = re.sub(r"[,;]+", " ", text)
+    description = re.sub(r"\s+", " ", description).strip()
+    return {"description": description, "size": size, "max_price": max_price}
+
+
+def _no_results_message(parsed: dict) -> str:
+    """
+    Say WHAT to change, not just that nothing came back.
+
+    Re-runs the (local, free) search with one filter relaxed at a time to find
+    out which constraint emptied the results. No model calls happen here.
+    """
+    desc, size, price = parsed["description"], parsed["size"], parsed["max_price"]
+    looked_for = f"'{desc}'" if desc else "your search"
+    filters = []
+    if size:
+        filters.append(f"size {size}")
+    if price is not None:
+        filters.append(f"under ${price:.0f}")
+    head = f"No listings matched {looked_for}" + (f" ({', '.join(filters)})" if filters else "") + "."
+
+    if not desc:
+        return head + " Tell me what kind of item you want, e.g. 'graphic tee', 'denim jacket', 'boots'."
+
+    if price is not None:
+        no_price = search_listings(desc, size, None)
+        if no_price:
+            cheapest = min(float(x["price"]) for x in no_price)
+            return head + f" Try raising your budget — the cheapest match is ${cheapest:.0f}."
+    if size:
+        no_size = search_listings(desc, None, price)
+        if no_size:
+            sizes = sorted({x["size"] for x in no_size})[:4]
+            return head + f" Try a different size or drop it — matches come in {', '.join(sizes)}."
+    if search_listings(desc, None, None):
+        return head + " Try removing both the size and the price limit."
+    return head + (
+        " Try different keywords — a category (tops, bottoms, outerwear, shoes, "
+        "accessories) or a style like 'vintage', 'y2k', 'grunge'."
+    )
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -41,10 +135,24 @@ def new_session(query: str, wardrobe: dict) -> dict:
         "search_results": [],        # everything search_listings returned
         "selected_item": None,       # the one you chose — goes into suggest_outfit
         "wardrobe": wardrobe,        # the user's wardrobe
+        "styling_mode": None,        # stretch branch: closet / no_style_match / empty_wardrobe
+        "styling_note": None,        # why that mode was chosen
+        "wardrobe_used": None,       # the wardrobe that actually went into suggest_outfit
         "outfit_suggestion": None,   # what suggest_outfit returned
         "fit_card": None,            # what create_fit_card returned
         "error": None,               # set when the run ended early
     }
+
+
+def _shared_style_tags(item: dict, wardrobe: dict) -> set[str]:
+    """Style tags the item has in common with anything in the wardrobe."""
+    item_tags = {t.lower() for t in item.get("style_tags") or []}
+    owned = {
+        t.lower()
+        for piece in (wardrobe or {}).get("items") or []
+        for t in piece.get("style_tags") or []
+    }
+    return item_tags & owned
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -107,8 +215,65 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     session = new_session(query, wardrobe)
 
-    # TODO: delete these two lines and build the loop.
-    session["error"] = "The planning loop isn't built yet — see the TODO in agent.py."
+    # Each pass round the loop reads the session, decides the next step, runs
+    # one tool, and writes its result back. Values go through the session —
+    # never straight from one call into the next.
+    next_step = "parse"
+    count = 0
+    while next_step != "done":
+        count += 1
+        trace.check_iterations(count)
+
+        if next_step == "parse":
+            session["parsed"] = parse_query(session["query"])
+            next_step = "search"
+
+        elif next_step == "search":
+            p = session["parsed"]
+            session["search_results"] = search_listings(
+                p["description"], p["size"], p["max_price"]
+            )
+            if not session["search_results"]:
+                session["error"] = _no_results_message(p)
+                next_step = "done"
+            else:
+                session["selected_item"] = session["search_results"][0]
+                next_step = "check_wardrobe"
+
+        elif next_step == "check_wardrobe":
+            # ── SECOND BRANCH (stretch) ── does the closet suit this item?
+            items = (session["wardrobe"] or {}).get("items") or []
+            shared = _shared_style_tags(session["selected_item"], session["wardrobe"])
+            if not items:
+                session["styling_mode"] = "empty_wardrobe"
+                session["styling_note"] = "No saved wardrobe — styling with common staples."
+                session["wardrobe_used"] = {"items": []}
+            elif not shared:
+                tags = ", ".join(session["selected_item"].get("style_tags") or [])
+                session["styling_mode"] = "no_style_match"
+                session["styling_note"] = (
+                    f"Nothing in your wardrobe shares a style with this piece ({tags}) "
+                    "— styling it with staples instead."
+                )
+                session["wardrobe_used"] = {"items": []}
+            else:
+                session["styling_mode"] = "closet"
+                session["styling_note"] = f"Matched your wardrobe on: {', '.join(sorted(shared))}."
+                session["wardrobe_used"] = session["wardrobe"]
+            next_step = "suggest"
+
+        elif next_step == "suggest":
+            session["outfit_suggestion"] = suggest_outfit(
+                session["selected_item"], session["wardrobe_used"]
+            )
+            next_step = "fit_card"
+
+        elif next_step == "fit_card":
+            session["fit_card"] = create_fit_card(
+                session["outfit_suggestion"], session["selected_item"]
+            )
+            next_step = "done"
+
     return session
 
 

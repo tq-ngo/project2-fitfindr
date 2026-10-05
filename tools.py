@@ -20,9 +20,72 @@ That last line is what your loop branches on. "Returns a list" earns nothing —
 the description has to say what is *in* the list.
 """
 
-import config  # noqa: F401 — you'll use this in search_listings
+import re
+
+import config
 from generate import generate
 from utils.data_loader import load_listings
+
+
+# ── Helper functions ────────────────────────────────────────────────────────────
+
+# Words that carry no meaning for matching
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "in", "on", "of", "to",
+    "i", "im", "me", "my", "want", "looking", "look", "find", "need", "some",
+    "something", "any", "anything", "please", "size", "under", "below", "max",
+    "less", "than", "cheap", "that", "is", "it", "its", "like", "would",
+}
+
+# Listing sizes that fit any requested size.
+_ONE_SIZE = re.compile(r"\bone\s*size\b", re.IGNORECASE)
+
+
+def _tokens(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens. "S/M" -> ["s", "m"], "W30 L30" -> ["w30", "l30"]."""
+    return re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", (text or "").lower().replace("'", ""))
+
+
+def _stem(word: str) -> str:
+    """Crude plural folding so "tees" matches "tee" and "jeans" matches "jean"."""
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _size_matches(wanted: str, listing_size: str) -> bool:
+    """
+    Token match, not substring match.
+
+    Every token of the requested size has to appear as a whole token in the
+    listing's size. So "M" matches "M", "S/M", "M/L" but NOT "US 9"; "L" does
+    not match "XL"; "W30" matches "W30 L30"; "US 8" does not match "US 8.5".
+    A "One Size" listing matches any requested size.
+    """
+    if _ONE_SIZE.search(listing_size or ""):
+        return True
+    want = set(_tokens(wanted))
+    have = set(_tokens(listing_size))
+    return bool(want) and want <= have
+
+
+def _describe_item(item: dict) -> str:
+    """A plain-text summary of a listing for prompts. Never prints a missing brand."""
+    parts = [
+        f"Title: {item.get('title', 'unknown item')}",
+        f"Category: {item.get('category', 'unknown')}",
+        f"Colors: {', '.join(item.get('colors') or []) or 'not listed'}",
+        f"Style tags: {', '.join(item.get('style_tags') or []) or 'none'}",
+        f"Size: {item.get('size', 'not listed')}",
+        f"Condition: {item.get('condition', 'not listed')}",
+        f"Price: ${float(item.get('price', 0)):.2f}",
+        f"Platform: {item.get('platform', 'unknown')}",
+    ]
+    if item.get("brand"):
+        parts.insert(1, f"Brand: {item['brand']}")
+    if item.get("description"):
+        parts.append(f"Seller description: {item['description']}")
+    return "\n".join(parts)
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -78,8 +141,40 @@ def search_listings(
     Test it from a terminal before you move on:
         python -c "from tools import search_listings; print(search_listings('graphic tee', max_price=30))"
     """
-    # TODO: replace this with your implementation
-    return []
+    query_words = {_stem(w) for w in _tokens(description) if w not in _STOPWORDS}
+    if not query_words:
+        return []
+
+    scored = []
+    for listing in load_listings():
+        price = float(listing.get("price", 0))
+        if max_price is not None and price > float(max_price):
+            continue
+        if size and not _size_matches(size, listing.get("size", "")):
+            continue
+
+        # Where a word matches says how much it counts. A word in the title or
+        # the tags is what the item IS; a word in the seller's blurb is weaker.
+        fields = {
+            3: listing.get("title", ""),
+            2: " ".join(
+                (listing.get("style_tags") or [])
+                + (listing.get("colors") or [])
+                + [listing.get("category", ""), listing.get("brand") or ""]
+            ),
+            1: listing.get("description", ""),
+        }
+        score = 0
+        for weight, text in fields.items():
+            field_words = {_stem(w) for w in _tokens(text)}
+            score += weight * len(query_words & field_words)
+
+        if score > 0:
+            scored.append((score, -price, listing))
+
+    # Highest score first; ties go to the cheaper item.
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [listing for _, _, listing in scored[: config.SEARCH_RESULT_LIMIT]]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -112,8 +207,51 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
     Test it from a terminal before you move on:
         python -c "from tools import suggest_outfit; from utils.data_loader import get_example_wardrobe, load_listings; print(suggest_outfit(load_listings()[0], get_example_wardrobe()))"
     """
-    # TODO: replace this with your implementation
-    return ""
+    items = (wardrobe or {}).get("items") or []
+    system = (
+        "You are a friendly personal stylist for someone who shops secondhand. "
+        "Be concrete and brief. Plain text, no markdown headers."
+    )
+
+    if not items:
+        prompt = (
+            "The user is considering this thrifted item but hasn't saved any "
+            "wardrobe pieces yet.\n\n"
+            f"{_describe_item(new_item)}\n\n"
+            "Suggest 2 outfits built around it using common staple pieces most "
+            "people own or could easily get (say what kind of piece, colour and "
+            "fit). One line per outfit, starting with 'Outfit 1:' and 'Outfit 2:'. "
+            "Then one short tip on what to look for next time they thrift."
+        )
+        fallback = (
+            f"Outfit 1: {new_item.get('title', 'This piece')} with straight-leg "
+            "jeans and clean white sneakers.\nOutfit 2: Dress it up with tailored "
+            "trousers and a simple neutral layer."
+        )
+    else:
+        closet = "\n".join(
+            f"- {w.get('name', 'unnamed')} ({w.get('category', '?')}; "
+            f"colors: {', '.join(w.get('colors') or []) or 'n/a'}; "
+            f"tags: {', '.join(w.get('style_tags') or []) or 'n/a'})"
+            + (f" — note: {w['notes']}" if w.get("notes") else "")
+            for w in items
+        )
+        prompt = (
+            "The user is considering this thrifted item:\n\n"
+            f"{_describe_item(new_item)}\n\n"
+            f"Their wardrobe:\n{closet}\n\n"
+            "Suggest 2 outfits that pair the new item with pieces they ALREADY "
+            "OWN. Name each wardrobe piece exactly as written above. One or two "
+            "lines per outfit, starting with 'Outfit 1:' and 'Outfit 2:'."
+        )
+        fallback = (
+            f"Outfit 1: {new_item.get('title', 'This piece')} with your "
+            f"{items[0].get('name', 'favourite basics')}."
+        )
+
+    response = (generate(prompt, system=system) or "").strip()
+    # The loop needs a non-empty string to pass on; never hand back "".
+    return response or fallback
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -152,5 +290,31 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     Test it from a terminal before you move on:
         python -c "from tools import create_fit_card; from utils.data_loader import load_listings; print(create_fit_card('jeans and white sneakers', load_listings()[0]))"
     """
-    # TODO: replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return (
+            "Couldn't write a fit card: no outfit suggestion was provided for "
+            f"{new_item.get('title', 'this item')}."
+        )
+
+    price = f"${float(new_item.get('price', 0)):.0f}"
+    platform = new_item.get("platform", "a thrift app")
+    system = (
+        "You write short, casual social media captions for thrift finds. "
+        "Sound like a real person posting an outfit, not a product listing."
+    )
+    prompt = (
+        f"The find:\n{_describe_item(new_item)}\n\n"
+        f"How they're styling it:\n{outfit.strip()}\n\n"
+        "Write ONE caption, 2 to 4 sentences, under 60 words. Rules:\n"
+        f"- mention the item, the price ({price}) and the platform ({platform}) "
+        "once each\n"
+        "- describe the vibe of ONE of the outfits specifically\n"
+        "- at most 2 emoji and at most 3 hashtags, at the end\n"
+        "- if no brand is given above, do not invent one\n"
+        "Return only the caption text, no quotes, no preamble."
+    )
+    caption = (generate(prompt, system=system) or "").strip().strip('"')
+    return caption or (
+        f"Thrifted this {new_item.get('title', 'piece')} for {price} on "
+        f"{platform} and I'm obsessed. Styled it exactly how I wanted."
+    )
