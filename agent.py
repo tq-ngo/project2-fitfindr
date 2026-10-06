@@ -16,7 +16,7 @@ Build and test your three tools in `tools.py` first. Then come here.
 import re
 
 import trace
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, compare_prices
 from generate import ModelUnavailable  # noqa: F401 — handler comes in unit 4
 
 
@@ -138,6 +138,7 @@ def new_session(query: str, wardrobe: dict) -> dict:
         "styling_mode": None,        # stretch branch: closet / no_style_match / empty_wardrobe
         "styling_note": None,        # why that mode was chosen
         "wardrobe_used": None,       # the wardrobe that actually went into suggest_outfit
+        "price_comparison": None,    # stretch tool: category price stats from compare_prices
         "outfit_suggestion": None,   # what suggest_outfit returned
         "fit_card": None,            # what create_fit_card returned
         "error": None,               # set when the run ended early
@@ -241,6 +242,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                 next_step = "check_wardrobe"
 
         elif next_step == "check_wardrobe":
+            # ── FOURTH TOOL (stretch): compare_prices ──
+            session["price_comparison"] = compare_prices(session["selected_item"])
+
             # ── SECOND BRANCH (stretch) ── does the closet suit this item?
             items = (session["wardrobe"] or {}).get("items") or []
             shared = _shared_style_tags(session["selected_item"], session["wardrobe"])
@@ -287,6 +291,8 @@ def _show(session: dict) -> None:
 
     item = session["selected_item"] or {}
     print(f"  found:    {item.get('title')} — ${item.get('price')} on {item.get('platform')}")
+    if session.get("price_comparison"):
+        print(f"  deal:     {session['price_comparison']['summary']}")
     print(f"  outfit:   {session['outfit_suggestion']}")
     print(f"  fit card: {session['fit_card']}")
 

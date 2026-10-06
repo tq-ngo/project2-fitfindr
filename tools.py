@@ -318,3 +318,105 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
         f"Thrifted this {new_item.get('title', 'piece')} for {price} on "
         f"{platform} and I'm obsessed. Styled it exactly how I wanted."
     )
+
+
+# ── Tool 4: compare_prices ──────────────────────────────────────────
+
+def compare_prices(item: dict) -> dict:
+    """
+    Compare an item's price against other listings in the same category.
+
+    Computes category statistics (average, minimum, and maximum prices) and assesses
+    whether the item is a 'great_deal' (<= 85% of average), 'fair' (85% to 115%),
+    or 'above_average' (> 115% of average).
+
+    Args:
+        item: a listing dict (e.g. from search_listings or session['selected_item']).
+
+    Returns:
+        A dict with category price stats and deal assessment:
+        {
+            "category": str,
+            "item_price": float,
+            "category_count": int,
+            "category_avg": float,
+            "category_min": float,
+            "category_max": float,
+            "deal_rating": str,       # 'great_deal', 'fair', 'above_average', or 'unknown'
+            "difference": float,      # item_price - category_avg (negative = cheaper than avg)
+            "summary": str,           # human-readable summary
+        }
+    """
+    if not item or not isinstance(item, dict):
+        return {
+            "category": "unknown",
+            "item_price": 0.0,
+            "category_count": 0,
+            "category_avg": 0.0,
+            "category_min": 0.0,
+            "category_max": 0.0,
+            "deal_rating": "unknown",
+            "difference": 0.0,
+            "summary": "No item provided for price comparison.",
+        }
+
+    category = item.get("category", "")
+    item_price = float(item.get("price", 0.0))
+
+    all_listings = load_listings()
+    same_category = [
+        float(x.get("price", 0.0))
+        for x in all_listings
+        if x.get("category") == category
+    ]
+
+    if not same_category:
+        return {
+            "category": category,
+            "item_price": item_price,
+            "category_count": 0,
+            "category_avg": item_price,
+            "category_min": item_price,
+            "category_max": item_price,
+            "deal_rating": "unknown",
+            "difference": 0.0,
+            "summary": f"No other listings found in category '{category}' to compare.",
+        }
+
+    category_avg = round(sum(same_category) / len(same_category), 2)
+    category_min = round(min(same_category), 2)
+    category_max = round(max(same_category), 2)
+    diff = round(item_price - category_avg, 2)
+
+    if item_price <= category_avg * 0.85:
+        deal_rating = "great_deal"
+        verdict = f"great deal (${abs(diff):.2f} below average)"
+    elif item_price <= category_avg * 1.15:
+        deal_rating = "fair"
+        verdict = f"fair price (within typical range, avg is ${category_avg:.2f})"
+    else:
+        deal_rating = "above_average"
+        verdict = f"above average price (${diff:.2f} above average of ${category_avg:.2f})"
+
+    summary = (
+        f"${item_price:.2f} is a {verdict} for {category} "
+        f"(category range: ${category_min:.2f} – ${category_max:.2f}, avg: ${category_avg:.2f})."
+    )
+    if deal_rating == "above_average":
+        summary = (
+            f"${item_price:.2f} is an {verdict} for {category} "
+            f"(category range: ${category_min:.2f} – ${category_max:.2f}, avg: ${category_avg:.2f})."
+        )
+
+    return {
+        "category": category,
+        "item_price": item_price,
+        "category_count": len(same_category),
+        "category_avg": category_avg,
+        "category_min": category_min,
+        "category_max": category_max,
+        "deal_rating": deal_rating,
+        "difference": diff,
+        "summary": summary,
+    }
+

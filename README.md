@@ -287,6 +287,78 @@ $ python app.py ask 'denim jacket under $50' --empty-wardrobe
   Styling:  [empty_wardrobe] No saved wardrobe — styling with common staples.
 ```
 
+---
+
+**A fourth tool: `compare_prices` (price comparison).** This lives in
+`tools.py::compare_prices`.
+
+- **What it does:** Given a listing dict, it searches all listings in
+  `data/listings.json` belonging to the same category (`tops`, `bottoms`,
+  `outerwear`, `shoes`, `accessories`). It calculates the category count, average
+  price, minimum price, and maximum price, and computes whether the piece is a
+  `great_deal` (<= 85% of category average), `fair` (within 85%–115%), or
+  `above_average` (> 115%).
+- **Inputs:** `item` (dict): listing dict (from `search_listings` or
+  `session["selected_item"]`).
+- **Returns:** `dict` containing:
+  - `category` (str)
+  - `item_price` (float)
+  - `category_count` (int)
+  - `category_avg` (float)
+  - `category_min` (float)
+  - `category_max` (float)
+  - `deal_rating` (str: `"great_deal"`, `"fair"`, `"above_average"`, or `"unknown"`)
+  - `difference` (float: item price minus category average)
+  - `summary` (str: human-readable price analysis)
+- **When it has nothing:** If given `None` or an item with no category, returns
+  `deal_rating: "unknown"` with default statistics and a descriptive summary
+  instead of crashing.
+- **Where it lives and runs:** `tools.py::compare_prices`. Automatically called
+  in `agent.py::run_agent` once an item is selected, stored in
+  `session["price_comparison"]`, and printed in `app.py` under `Deal:`.
+
+**Terminal test:**
+
+```
+$ python -c "from tools import compare_prices; from utils.data_loader import load_listings; print(compare_prices(load_listings()[0])['summary'])"
+$38.00 is an above average price ($8.60 above average of $29.40) for bottoms (category range: $14.00 – $38.00, avg: $29.40).
+```
+
+---
+
+**Style memory: persistent wardrobe between runs.** This lives in
+`utils/data_loader.py` and `app.py`.
+
+- **What it does:** The agent remembers the user's wardrobe across runs in
+  `data/user_wardrobe.json`. The user can inspect their saved closet, add new
+  pieces, reset it, or automatically save thrift finds into their closet for
+  future runs.
+- **Where it lives:**
+  - `utils/data_loader.py`: `load_saved_wardrobe()`, `save_wardrobe()`,
+    `add_wardrobe_item()`, `reset_saved_wardrobe()`.
+  - `app.py`: `wardrobe` subparser (`cmd_wardrobe`) and `--save` flag on `ask`.
+- **How it works:**
+  - View saved wardrobe: `python app.py wardrobe`
+  - Add an item: `python app.py wardrobe --add "Oversized Leather Biker Jacket" --category outerwear --style "grunge,vintage,leather"`
+  - Automatically save a thrift find: `python app.py ask 'vintage graphic tee under $30' --save`
+  - Reset to default: `python app.py wardrobe --reset`
+  - Use original starter example for one run: `python app.py ask '...' --example-wardrobe`
+- **Verification:** Items added to the persistent wardrobe immediately flow
+  into `suggest_outfit` on subsequent queries without the user having to re-enter
+  or describe them again.
+
+```
+$ python app.py wardrobe --add "Oversized Leather Biker Jacket" --category outerwear --style "grunge,vintage,leather" --colors "black"
+Added 'Oversized Leather Biker Jacket' to persistent wardrobe! Total items: 11.
+
+$ python app.py ask 'vintage graphic tee under $30'
+  Found:    Graphic Tee — 2003 Tour Bootleg Style — $24.0 on depop
+  Deal:     $24.00 is a fair price (within typical range, avg is $21.73) for tops (category range: $15.00 – $35.00, avg: $21.73).
+  Styling:  [closet] Matched your wardrobe on: grunge, streetwear, vintage.
+
+  Outfit:   Outfit 1: Pair the graphic tee with your baggy straight-leg jeans, black combat boots, and the oversized leather biker jacket for an effortless, grungy streetwear look.
+```
+
 <!-- ═══════════════════════ UNIT 4 — THE TEST ═══════════════════════
 
      Don't fill these in during unit 3.

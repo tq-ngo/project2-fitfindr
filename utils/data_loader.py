@@ -86,6 +86,81 @@ def get_empty_wardrobe() -> dict:
     return _wardrobe("empty_wardrobe")
 
 
+# ── Style Memory: persistent wardrobe between runs ──────────────────
+
+_USER_WARDROBE_PATH = os.path.join(_DATA_DIR, "user_wardrobe.json")
+
+
+def load_saved_wardrobe() -> dict:
+    """
+    Load the persistent user wardrobe from disk (data/user_wardrobe.json).
+    If no saved wardrobe exists yet, initializes it from the example wardrobe.
+
+    Returns:
+        A wardrobe dict with an 'items' list.
+    """
+    if os.path.exists(_USER_WARDROBE_PATH):
+        try:
+            with open(_USER_WARDROBE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "items" in data:
+                    return data
+        except Exception:
+            pass
+
+    # Initialize with example wardrobe
+    wardrobe = get_example_wardrobe()
+    save_wardrobe(wardrobe)
+    return wardrobe
+
+
+def save_wardrobe(wardrobe: dict) -> None:
+    """
+    Persist the wardrobe to disk (data/user_wardrobe.json).
+    """
+    with open(_USER_WARDROBE_PATH, "w", encoding="utf-8") as f:
+        json.dump(wardrobe, f, indent=2)
+
+
+def add_wardrobe_item(
+    name: str,
+    category: str,
+    colors: list[str] | None = None,
+    style_tags: list[str] | None = None,
+    notes: str | None = None,
+) -> dict:
+    """
+    Add a new item to the user's persistent wardrobe and save it.
+
+    Returns:
+        The updated wardrobe dict.
+    """
+    wardrobe = load_saved_wardrobe()
+    items = wardrobe.setdefault("items", [])
+    new_id = f"w_user_{len(items) + 1:03d}"
+    item = {
+        "id": new_id,
+        "name": name,
+        "category": category,
+        "colors": colors or [],
+        "style_tags": style_tags or [],
+        "notes": notes,
+    }
+    items.append(item)
+    save_wardrobe(wardrobe)
+    return wardrobe
+
+
+def reset_saved_wardrobe(to_empty: bool = False) -> dict:
+    """
+    Reset the persistent wardrobe to either the example wardrobe or an empty wardrobe.
+    """
+    wardrobe = get_empty_wardrobe() if to_empty else get_example_wardrobe()
+    save_wardrobe(wardrobe)
+    return wardrobe
+
+
+
 # --- Quick sanity check ---
 if __name__ == "__main__":
     listings = load_listings()

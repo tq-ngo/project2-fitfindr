@@ -119,6 +119,8 @@ def _ask_one(query, wardrobe, use_trace):
     else:
         item = session["selected_item"] or {}
         print(f"  Found:    {item.get('title')} — ${item.get('price')} on {item.get('platform')}")
+        if session.get("price_comparison"):
+            print(f"  Deal:     {session['price_comparison']['summary']}")
         if session.get("styling_note"):
             print(f"  Styling:  [{session.get('styling_mode')}] {session['styling_note']}")
         print()
@@ -137,17 +139,77 @@ def _ask_one(query, wardrobe, use_trace):
     return session
 
 
+def cmd_wardrobe(args):
+    """View and manage persistent style memory wardrobe."""
+    from utils.data_loader import (
+        load_saved_wardrobe,
+        add_wardrobe_item,
+        reset_saved_wardrobe,
+    )
+
+    if args.reset:
+        w = reset_saved_wardrobe(to_empty=False)
+        print(f"Reset persistent wardrobe to example items ({len(w['items'])} items).")
+        return
+    if args.clear:
+        w = reset_saved_wardrobe(to_empty=True)
+        print("Cleared persistent wardrobe (0 items).")
+        return
+    if args.add:
+        tags = [t.strip() for t in (args.style or "").split(",") if t.strip()]
+        colors = [c.strip() for c in (args.colors or "").split(",") if c.strip()]
+        w = add_wardrobe_item(
+            name=args.add,
+            category=args.category or "tops",
+            colors=colors,
+            style_tags=tags,
+            notes=args.notes,
+        )
+        print(f"Added '{args.add}' to persistent wardrobe! Total items: {len(w['items'])}.")
+        return
+
+    w = load_saved_wardrobe()
+    items = w.get("items", [])
+    print(f"Persistent Wardrobe ({len(items)} items):\n")
+    for i, it in enumerate(items, 1):
+        cols = ", ".join(it.get("colors") or []) or "n/a"
+        tags = ", ".join(it.get("style_tags") or []) or "n/a"
+        print(f"  [{i:02d}] {it.get('name')} ({it.get('category')})")
+        print(f"       colors: {cols} | style: {tags}")
+        if it.get("notes"):
+            print(f"       note: {it['notes']}")
+
+
 def cmd_ask(args):
-    from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+    from utils.data_loader import (
+        get_example_wardrobe,
+        get_empty_wardrobe,
+        load_saved_wardrobe,
+        add_wardrobe_item,
+    )
     import generate
 
-    wardrobe = get_empty_wardrobe() if args.empty_wardrobe else get_example_wardrobe()
     if args.empty_wardrobe:
+        wardrobe = get_empty_wardrobe()
         print("(running with an empty wardrobe)")
+    elif args.example_wardrobe:
+        wardrobe = get_example_wardrobe()
+    else:
+        wardrobe = load_saved_wardrobe()
 
     try:
         if args.query:
-            _ask_one(args.query, wardrobe, args.trace)
+            session = _ask_one(args.query, wardrobe, args.trace)
+            if args.save and session.get("selected_item"):
+                sel = session["selected_item"]
+                add_wardrobe_item(
+                    name=sel.get("title", "Thrift piece"),
+                    category=sel.get("category", "tops"),
+                    colors=sel.get("colors") or [],
+                    style_tags=sel.get("style_tags") or [],
+                    notes=f"Thrifted for ${sel.get('price', 0)} on {sel.get('platform')}",
+                )
+                print(f"  [style memory] Saved '{sel.get('title')}' to persistent wardrobe!\n")
         else:
             print("Ask for something, or press Enter on an empty line to quit.\n")
             while True:
@@ -158,7 +220,17 @@ def cmd_ask(args):
                     break
                 if not query:
                     break
-                _ask_one(query, wardrobe, args.trace)
+                session = _ask_one(query, wardrobe, args.trace)
+                if args.save and session.get("selected_item"):
+                    sel = session["selected_item"]
+                    add_wardrobe_item(
+                        name=sel.get("title", "Thrift piece"),
+                        category=sel.get("category", "tops"),
+                        colors=sel.get("colors") or [],
+                        style_tags=sel.get("style_tags") or [],
+                        notes=f"Thrifted for ${sel.get('price', 0)} on {sel.get('platform')}",
+                    )
+                    print(f"  [style memory] Saved '{sel.get('title')}' to persistent wardrobe!\n")
     finally:
         print(generate.usage())
 
@@ -191,7 +263,33 @@ def build_parser():
         action="store_true",
         help="run as a user with nothing saved — one of unit 4's failure modes",
     )
+    p_ask.add_argument(
+        "--example-wardrobe",
+        action="store_true",
+        help="use the starter example wardrobe instead of your saved persistent wardrobe",
+    )
+    p_ask.add_argument(
+        "--save",
+        action="store_true",
+        help="save the matched thrift find into your persistent style memory wardrobe",
+    )
     p_ask.set_defaults(func=cmd_ask)
+
+    # ── Style Memory: wardrobe manager command ──
+    p_w = sub.add_parser("wardrobe", help="view and manage persistent style memory wardrobe")
+    p_w.add_argument("--add", metavar="NAME", help="add an item to your wardrobe by name")
+    p_w.add_argument(
+        "--category",
+        choices=["tops", "bottoms", "outerwear", "shoes", "accessories"],
+        default="tops",
+        help="category for added item (default: tops)",
+    )
+    p_w.add_argument("--colors", help="comma-separated colors (e.g. 'black,white')")
+    p_w.add_argument("--style", help="comma-separated style tags (e.g. 'vintage,grunge')")
+    p_w.add_argument("--notes", help="notes on fit or styling")
+    p_w.add_argument("--reset", action="store_true", help="reset persistent wardrobe to example items")
+    p_w.add_argument("--clear", action="store_true", help="clear persistent wardrobe to an empty closet")
+    p_w.set_defaults(func=cmd_wardrobe)
 
     return parser
 
